@@ -2,9 +2,9 @@ import asyncio
 import os
 from contextlib import AsyncExitStack
 from typing import Any
+import json
 
-from google import genai
-from google.genai import types
+from groq import Groq
 from client import MCPClient
 from dotenv import load_dotenv
 
@@ -15,12 +15,12 @@ class ChatHost:
     def __init__(self):
         self.mcp_clients: list[MCPClient] = [
             MCPClient("./weather_USA.py"),
-            MCPClient("./weather_Israel.py"),  # Israeli MCP with Playwright
+            MCPClient("./weather_Israel.py"),
         ]
         self.tool_clients: dict[str, tuple[MCPClient, str]] = {}
         self.clients_connected = False
         self.exit_stack = AsyncExitStack()
-        self.gemini = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        self.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
     async def connect_mcp_clients(self):
         """Connect all configured MCP clients once."""
@@ -72,68 +72,67 @@ class ChatHost:
         return available_tools
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Gemini and available tools"""
-        available_tools = await self.get_available_tools()
-        final_text = []
+        """Process a query using Groq and available tools"""
+        try:
+            available_tools = await self.get_available_tools()
+            final_text = []
 
-        # Convert MCP tool schemas to Gemini function declarations
-        gemini_tools = [
-            types.Tool(function_declarations=[
-                types.FunctionDeclaration(
-                    name=t["name"],
-                    description=t["description"],
-                    parameters=t["input_schema"] if t["input_schema"].get("properties") else None,
-                )
+            groq_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
+                    },
+                }
                 for t in available_tools
-            ])
-        ]
+            ]
 
-        contents = [types.Content(role="user", parts=[types.Part(text=query)])]
+            messages = [
+                {"role": "system", "content": "You are a helpful weather assistant. When asked about Israeli cities, always use English city names (e.g., 'Tel Aviv', 'Jerusalem', 'Haifa'). The tools will automatically translate them to Hebrew."},
+                {"role": "user", "content": query}
+            ]
 
-        while True:
-            response = self.gemini.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(tools=gemini_tools),
-            )
+            while True:
+                response = self.groq.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    tools=groq_tools,
+                    tool_choice="auto",
+                )
 
-            candidate = response.candidates[0].content
-            contents.append(candidate)
+                message = response.choices[0].message
+                messages.append(message)
 
-            saw_tool_use = False
-            tool_results = []
+                if message.content:
+                    final_text.append(message.content)
 
-            for part in candidate.parts:
-                if part.text:
-                    final_text.append(part.text)
+                if not message.tool_calls:
+                    break
 
-                if not part.function_call:
-                    continue
+                for tool_call in message.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = json.loads(tool_call.function.arguments)
 
-                saw_tool_use = True
-                tool_name = part.function_call.name
-                tool_args = dict(part.function_call.args)
+                    if tool_name not in self.tool_clients:
+                        raise RuntimeError(f"Unknown tool requested by model: {tool_name}")
 
-                if tool_name not in self.tool_clients:
-                    raise RuntimeError(f"Unknown tool requested by model: {tool_name}")
+                    client, original_tool_name = self.tool_clients[tool_name]
+                    result = await client.session.call_tool(original_tool_name, tool_args)
 
-                client, original_tool_name = self.tool_clients[tool_name]
-                result = await client.session.call_tool(original_tool_name, tool_args)
+                    result_text = " ".join(c.text for c in result.content if hasattr(c, "text"))
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
-                # Extract text from MCP result content
-                result_text = " ".join(c.text for c in result.content if hasattr(c, "text"))
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-                tool_results.append(types.Part.from_function_response(
-                    name=tool_name,
-                    response={"result": result_text},
-                ))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_text,
+                    })
 
-            if not saw_tool_use:
-                break
-
-            contents.append(types.Content(role="user", parts=tool_results))
-
-        return "\n".join(final_text)
+            return "\n".join(final_text)
+        except Exception as e:
+            return f"Error processing query: {str(e)}\n\nPlease try rephrasing your question."
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
@@ -152,6 +151,7 @@ class ChatHost:
 
             except Exception as e:
                 print(f"\nchat_loop Error: {str(e)}")
+                print("\nTip: Try rephrasing your question or ask again.")
 
     async def cleanup(self):
         """Clean up resources"""
